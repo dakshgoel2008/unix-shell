@@ -7,6 +7,7 @@
 
 #define MAX_INPUT_SIZE 1024     // max length of user input
 #define MAX_ARG_SIZE 64         // max number of arguments
+#define MAX_CMDS 16             // max commands in one pipeline
 
 typedef struct {
     char *inFile;       // <
@@ -14,6 +15,11 @@ typedef struct {
     char *errFile;      // 2>
     int append;         // 1 if >> was used
 } Redirect;
+
+typedef struct {
+    char *args[MAX_ARG_SIZE];
+    Redirect redirect;
+} Command;
 
 void initPrint(){
     printf("Welcome to the Unix Shell!\n");
@@ -102,6 +108,53 @@ void redirectFd(char *file, int flags, int targetFd){
     close(fd);
 }
 
+int countChar(char *s, char c){
+    int count = 0;
+    for(; *s; s++){
+        if(*s == c) count++;
+    }
+    return count;
+}
+
+// splits the line on '|' and parses each part into cmds
+// returns number of commands, 0 for an empty line, -1 on syntax error
+int parseLine(char *input, Command *cmds){
+    int pipes = countChar(input, '|');
+    char *parts[MAX_CMDS];
+    int n = 0;
+
+    char *part = strtok(input, "|");
+    while(part != NULL && n < MAX_CMDS){
+        parts[n++] = part;
+        part = strtok(NULL, "|");
+    }
+    if(part != NULL){
+        fprintf(stderr, "too many commands in pipeline (max %d)\n", MAX_CMDS);
+        return -1;
+    }
+
+    if(n == 0 && pipes == 0) return 0;
+    if(n != pipes + 1){
+        fprintf(stderr, "syntax error near '|'\n");
+        return -1;
+    }
+
+    // parseInput also uses strtok, so it can only run after the loop above is done
+    for(int i = 0; i < n; i++){
+        if(parseInput(parts[i], cmds[i].args) == 0){
+            if(pipes == 0) return 0;    // just an empty line
+            fprintf(stderr, "syntax error near '|'\n");
+            return -1;
+        }
+        if(parseRedirects(cmds[i].args, &cmds[i].redirect) != 0) return -1;
+        if(cmds[i].args[0] == NULL){
+            fprintf(stderr, "syntax error: missing command\n");
+            return -1;
+        }
+    }
+    return n;
+}
+
 void applyRedirects(Redirect *r){
     if(r->inFile){
         redirectFd(r->inFile, O_RDONLY, STDIN_FILENO);
@@ -163,30 +216,74 @@ int runBuiltin(char **args){
     return 0;
 }
 
-void runCommand(char **args, Redirect *r){
-    pid_t pid = fork();
+// runs n commands, connecting the stdout of each one to the stdin of the next
+void runPipeline(Command *cmds, int n){
+    pid_t pids[MAX_CMDS];
+    int started = 0;
+    int prevRead = -1;      // read end of the pipe coming from the previous command
 
-    if(pid < 0){
-        perror("fork");
-        return;
+    for(int i = 0; i < n; i++){
+        int fds[2];
+        int isLast = (i == n - 1);
+
+        if(!isLast && pipe(fds) < 0){
+            perror("pipe");
+            break;
+        }
+
+        pid_t pid = fork();
+        if(pid < 0){
+            perror("fork");
+            if(!isLast){
+                close(fds[0]);
+                close(fds[1]);
+            }
+            break;
+        }
+
+        if(pid == 0){
+            if(prevRead != -1){
+                dup2(prevRead, STDIN_FILENO);
+                close(prevRead);
+            }
+            if(!isLast){
+                close(fds[0]);
+                dup2(fds[1], STDOUT_FILENO);
+                close(fds[1]);
+            }
+            // explicit redirects win over the pipe, same as bash
+            applyRedirects(&cmds[i].redirect);
+
+            char **args = cmds[i].args;
+            if(runBuiltin(args)) exit(0);
+            execvp(args[0], args);
+            // execvp only returns if it failed
+            fprintf(stderr, "%s: command not found\n", args[0]);
+            exit(127);
+        }
+
+        pids[started++] = pid;
+
+        // the parent must close its copies, otherwise the next command never sees EOF
+        if(prevRead != -1) close(prevRead);
+        if(!isLast){
+            close(fds[1]);
+            prevRead = fds[0];
+        } else {
+            prevRead = -1;
+        }
     }
 
-    if(pid == 0){
-        applyRedirects(r);
-        execvp(args[0], args);
-        // execvp only returns if it failed
-        fprintf(stderr, "%s: command not found\n", args[0]);
-        exit(127);
-    }
+    if(prevRead != -1) close(prevRead);
 
-    int status;
-    waitpid(pid, &status, 0);
+    for(int i = 0; i < started; i++){
+        waitpid(pids[i], NULL, 0);
+    }
 }
 
 int main(){
     char input[MAX_INPUT_SIZE];
-    char *args[MAX_ARG_SIZE];
-    Redirect redirect;
+    Command cmds[MAX_CMDS];
 
     initPrint();
 
@@ -194,13 +291,13 @@ int main(){
         printPrompt();
         if(!takeInput(input)) break;
 
-        if(parseInput(input, args) == 0) continue;
-        if(parseRedirects(args, &redirect) != 0) continue;
-        if(args[0] == NULL) continue;   // line was only a redirect, e.g. "> file"
+        int n = parseLine(input, cmds);
+        if(n <= 0) continue;
 
-        if(!runBuiltin(args)){
-            runCommand(args, &redirect);
-        }
+        // a lone built-in must run in the shell itself, or cd would be lost with the child
+        if(n == 1 && runBuiltin(cmds[0].args)) continue;
+
+        runPipeline(cmds, n);
     }
 
     return 0;
