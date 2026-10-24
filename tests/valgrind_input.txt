@@ -1,0 +1,12 @@
+echo "hello   world" 'single $HOME' "home=$HOME"
+export NAME=valgrind; echo $NAME
+ls /nonexistent 2>&1 | wc -l
+seq 1 100 | grep 1 | sort -r | head -3
+echo one > /tmp/valgrind_shell_test.txt; cat < /tmp/valgrind_shell_test.txt
+false && echo no || echo yes
+nosuchcommand
+echo "unterminated
+history
+!!
+cd /tmp; pwd
+exit
